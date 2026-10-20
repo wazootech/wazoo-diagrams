@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wazoo world model</title>
+</head>
+<body>
+<script src="../../engine/core.js"></script>
+<script>
+/* ---------- geometry (x = depth, y = width, z = height) ----------
+   The machine is Wazoo's memory layer: fact cards go in the top, become nodes and edges in the world graph behind
+   the glass, get indexed three ways (vector, keyword, SPARQL), and questions come back out as answer cards that
+   name the fact card they came from. The small terminal beside it is the agent that writes facts and reads answers. */
+const W = 56, Y0 = 44, Y1 = 130, H = 128, R = 8, T = 6;
+const WIN = [58,60,118,108];              // glass window on the front: y0,z0,y1,z1
+const SCR = [58,20,118,40];               // query screen
+const OUTS = [66,8,110,14];               // answer slot
+const INTAKE = [22,64,28,112];            // top slot: x0,y0,x1,y1
+const SLOT = [25, 88];                    // where a card goes in (x, y)
+const AG = [70,6,98,36,26];               // agent terminal: x0,y0,x1,y1,height
+const CARD_U = 13, CARD_V = 9;            // card half sizes
+const PAPER = { l:'#fffaf0', m:'#ece4d0', d:'#cfc4aa' };
+const AGENT_M = { l:'#ece6d6', m:'#cfc8b8', d:'#8f887a' };
+const GREEN = '#43c25c', GLOW = '#8af0ae';
+
+/* ---------- the world: nodes are entities, edges are facts ---------- */
+const NODES = {
+  ADA:   [38, 82, 74],
+  GRACE: [44, 62, 84],
+  TEA:   [32, 82, 46],
+  NYC:   [40, 54, 54],
+  NOTES: [26, 58, 48],
+};
+const FACTS = [
+  { label:'ADA likes TEA',       from:'ADA',   to:'TEA',   node:'TEA' },
+  { label:'GRACE lives in NYC',  from:'GRACE', to:'NYC',   node:'NYC' },
+  { label:'ADA wrote NOTES',     from:'ADA',   to:'NOTES', node:'NOTES' },
+];
+const QUESTIONS = [
+  { label:'Search: what does Ada like?',    how:'search', fact:0, screen:['ADA LIKES ?', 'HYBRID SEARCH'], answer:'ADA LIKES TEA',  short:'TEA' },
+  { label:'SPARQL: who lives where?',       how:'sparql', fact:1, screen:['?WHO LIVESIN ?', 'SPARQL'],      answer:'GRACE IN NYC',   short:'GRACE NYC' },
+  { label:'Search: what did Ada write?',    how:'search', fact:2, screen:['ADA WROTE ?', 'HYBRID SEARCH'],  answer:'ADA WROTE NOTES', short:'NOTES' },
+];
+
+/* ---------- state ---------- */
+const st = { pal:'cobalt', facts:[false,false,false], busy:null, imp:null, ask:null, out:null, fly:null, agent:['AGENT','READY'], answers:0 };
+
+/* ---------- small parts ---------- */
+// a paper card from its centre and two half-axis vectors (u across, v along)
+function wzCard(c, u, v, alpha=1){
+  const q = (a,b) => [c[0]+a*u[0]+b*v[0], c[1]+a*u[1]+b*v[1], c[2]+a*u[2]+b*v[2]];
+  let n = norm(cross(u, v)); if (!vis(n)) n = n.map(x => -x);
+  let s = shape([q(1,1),q(-1,1),q(-1,-1),q(1,-1)], toneI(n, PAPER), 1);
+  for (const b of [.45, 0, -.45]) s += line([q(.7,b), q(b ? -.35 : -.7,b)], .6);
+  return alpha < 1 ? `<g opacity="${alpha.toFixed(2)}">${s}</g>` : s;
+}
+const flatV = a => [CARD_V*Math.cos(a), 0, CARD_V*Math.sin(a)];
+const stackTop = k => [84, 21, AG[4] + 1.5 + k*1.2 + .6];
+
+// a node of the world graph: a small sphere, green while it is being used
+function wzNode(name, k, active){
+  const c = NODES[name], [X,Y] = P(...c), r = 4.2*1.2247*k;
+  if (r < .2) return '';
+  const base = active ? matOf(GLOW) : CERAMIC;
+  return `<circle cx="${f(X)}" cy="${f(Y)}" r="${f(r)}" fill="${base.m}"/>`
+    + `<circle cx="${f(X+r*.18)}" cy="${f(Y-r*.2)}" r="${f(r*.78)}" fill="${base.l}"/>`
+    + `<circle cx="${f(X+r*.35)}" cy="${f(Y-r*.42)}" r="${f(r*.18)}" fill="#ffffff" opacity=".8"/>`
+    + `<circle cx="${f(X)}" cy="${f(Y)}" r="${f(r)}" fill="none" stroke="${INK}" stroke-width="1.1"/>`
+    + (k > .6 ? tx(c[0]+4, c[1], c[2]-10, name, 4.4, INK, 800) : '');
+}
+function wzEdge(a, b, k, active){
+  if (k <= 0) return '';
+  const A = NODES[a], B = NODES[b], E = [A[0]+(B[0]-A[0])*k, A[1]+(B[1]-A[1])*k, A[2]+(B[2]-A[2])*k];
+  return `<path d="${pd([A,E],false)}" fill="none" stroke="${active ? GREEN : INK}" stroke-width="${active ? 2.2 : 1.3}" stroke-linecap="round"/>`;
+}
+
+/* ---------- what is lit right now ---------- */
+function phase(){
+  const lit = { vector:false, keyword:false, sparql:false, intake:false, world:false, nodes:{}, edges:{} };
+  if (st.imp){ const t = st.imp.t, F = FACTS[st.imp.i];
+    lit.intake = t < .82;
+    if (t > .6){ lit.world = true; lit.nodes[F.node] = true; lit.edges[F.from+F.to] = true; }
+    lit.vector = t > .8 && t < .93; lit.keyword = t > .85 && t < .97; lit.sparql = t > .9; }
+  if (st.ask){ const t = st.ask.t, Q = QUESTIONS[st.ask.q], F = FACTS[Q.fact];
+    if (t < .75){ if (Q.how === 'search'){ lit.vector = lit.keyword = true; } else lit.sparql = true; }
+    if (t > .25 && t < .8 && st.ask.ok){ lit.world = true; lit.nodes[F.from] = true;
+      if (t > .45){ lit.edges[F.from+F.to] = true; lit.nodes[F.to] = true; } } }
+  return lit;
+}
+// how far a fact's node and edge have grown in (0..1)
+function grown(i){
+  if (st.facts[i]) return 1;
+  if (st.imp && st.imp.i === i) return Math.max(0, Math.min(1, (st.imp.t - .62)/.2));
+  return 0;
+}
+
+/* ---------- scene ---------- */
+const OUT = rrUV(Y0,0,Y1,H,R), IN = rrUV(Y0+T,T,Y1-T,H-T,R-T);
+function screenLines(){
+  if (st.imp) return st.imp.t < .62 ? ['IMPORTING', 'CARD ' + (st.imp.i+1)] : ['INDEXING', 'VECTOR KEYWORD RDF'];
+  if (st.ask){ const Q = QUESTIONS[st.ask.q]; return st.ask.t < .8 ? Q.screen : st.ask.ok ? ['FOUND 1', 'FROM CARD ' + (Q.fact+1)] : ['0 RESULTS', 'NO SUCH FACT']; }
+  if (st.out) return st.out.ok ? ['ANSWER READY', 'TAKE THE CARD'] : ['0 RESULTS', 'TAKE THE CARD'];
+  return ['WORLD', factCount() + ' FACTS'];
+}
+const factCount = () => 1 + st.facts.filter(Boolean).length;
+
+function scene(stt, m){
+  const lit = phase();
+  let s = '';
+  const [ax0,ay0,ax1,ay1,ah] = AG;
+
+  // cast shadows
+  s += castShadow([...on(PX(0),OUT), ...on(PX(W),OUT)]);
+  s += castShadow([[ax0,ay0,0],[ax1,ay0,0],[ax1,ay1,0],[ax0,ay1,0],[ax0,ay0,ah],[ax1,ay0,ah],[ax1,ay1,ah],[ax0,ay1,ah]]);
+
+  // ---- the machine ----
+  const X = PX(W), win = rectUV(WIN[0],WIN[1],WIN[2],WIN[3]), outs = rectUV(OUTS[0],OUTS[1],OUTS[2],OUTS[3]);
+
+  // the world graph behind the glass
+  let it = fill(pd(on(PX(T),IN)), '#e8eef0');
+  it += loft(on(PX(T),IN), on(PX(W-3),IN), n => n[2]>.7 ? '#d3dbde' : '#dfe7e9', true);
+  it += wzEdge('ADA','GRACE',1,false);
+  FACTS.forEach((F,i) => { it += wzEdge(F.from, F.to, grown(i), !!lit.edges[F.from+F.to]); });
+  const shown = { ADA:1, GRACE:1 }; FACTS.forEach((F,i) => { const g = grown(i); if (g > 0) shown[F.node] = ease(g); });
+  it += byDepth(Object.keys(shown).map(n => ({ at:NODES[n], svg: wzNode(n, shown[n], !!lit.nodes[n]) })));
+  s += clipTo(on(X,win), it);
+
+  // glass: tint, streaks, reveal
+  const GX = PX(W-2.9);
+  s += `<g pointer-events="none">${fill(pd(on(GX,win)),'#cfe9f0','opacity=".2"')}`
+     + fill(pd(on(GX,[[66,60],[76,60],[104,108],[94,108]])),'#ffffff','opacity=".38"')
+     + fill(pd(on(GX,[[82,60],[86,60],[114,108],[110,108]])),'#ffffff','opacity=".38"') + `</g>`;
+  s += face(pd([[W-3,WIN[0],WIN[1]],[W,WIN[0],WIN[1]],[W,WIN[0],WIN[3]],[W-3,WIN[0],WIN[3]]]), tone([0,1,0],m));
+  s += face(pd([[W-3,WIN[0],WIN[1]],[W,WIN[0],WIN[1]],[W,WIN[2],WIN[1]],[W-3,WIN[2],WIN[1]]]), tone([0,0,1],m));
+
+  // answer slot cavity
+  s += fill(pd(on(X,outs)), '#1f1d1a');
+
+  // front face with its openings
+  s += `<path d="${pd(on(X,OUT))}${pd(on(X,win))}${pd(on(X,outs))}" fill="${tone([1,0,0],m)}" fill-rule="evenodd"/>`;
+  s += ink(pd(on(X,win)),1.8) + ink(pd(on(X,outs)),1.6);
+
+  // outer body, side decal, top intake slot
+  s += extrude(OUT, 0, W, m);
+  const sm = tone([0,1,0],m), dc = sm === m.l ? m.m : mix(sm,'#ffffff',.35);
+  s += shape(on(PY(Y1+.2), rrUV(10,62,W-10,92,5)), mix(sm,'#ffffff',.12), 1.2);
+  s += txY(W/2, Y1+.3, 79, 'MEMORY', 8, dc, 800) + txY(W/2, Y1+.3, 70.5, 'LAYER', 5, dc, 800);
+  const top = PZ(H+.1);
+  s += shape(on(top, rrUV(INTAKE[0]-3,INTAKE[1]-3,INTAKE[2]+3,INTAKE[3]+3,2.5)), METAL.l, 1.1);
+  s += shape(on(PZ(H+.2), rectUV(INTAKE[0],INTAKE[1],INTAKE[2],INTAKE[3])), '#26231f', 1);
+
+  // silhouette
+  s += ink(pd(on(X,OUT)),2.2) + hullInk([...on(PX(0),OUT), ...on(PX(W),OUT)], 2.8);
+
+  // ---- mounted on the front ----
+  const F = PX(W+.3);
+  s += shape(on(F, rrUV(58,112,118,124,3)), '#fff4d6', 1.4);
+  s += tx(W+.4, 88, 115, 'WAZOO', 8, m.d, 800);
+  s += shape(on(F, rrUV(SCR[0],SCR[1],SCR[2],SCR[3],2.5)), '#1d2a26', 1.3);
+  const [l1,l2] = screenLines();
+  s += tx(W+.4, 88, 32, l1, 4.4, GLOW, 700) + tx(W+.4, 88, 24.5, l2, 3.2, GLOW, 700);
+  // index lamps
+  [['VECTOR',108,lit.vector],['KEYWORD',88,lit.keyword],['SPARQL',68,lit.sparql]].forEach(([name,y,on1]) => {
+    s += cylX(W, W+1.4, y, 52, 3.2, on1 ? matOf(GREEN) : METAL, toneI, 1);
+    if (on1) s += `<circle cx="${f(P(W+1.5,y,52)[0])}" cy="${f(P(W+1.5,y,52)[1])}" r="${f(6)}" fill="${GLOW}" opacity=".35"/>`;
+    s += tx(W+.4, y, 43.5, name, 3.3, INK, 800);
+  });
+  // answer ledge + the card coming out of the slot
+  s += box(W, OUTS[0]+2, 5, W+20, OUTS[2]-2, 8, METAL, toneI, 1);
+  if (st.out || st.ask){
+    const slide = st.out ? 18 : Math.max(0, Math.min(1, (st.ask.t - .78)/.22)) * 18;
+    if (slide > 0){
+      const xe = W + slide, z = 8.3, Q = QUESTIONS[(st.out || st.ask).q], ok = (st.out || st.ask).ok;
+      let cs = shape(on(PZ(z), rectUV(xe-26, 72, xe, 104)), PAPER.l, 1);
+      const txH = (x, str, size) => `<text transform="${txM(P(x, 88, z), Dv(0,-1,0), Dv(1,0,0))}" font-size="${size}" fill="${INK}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="800">${str}</text>`;
+      cs += txH(xe-12, ok ? Q.answer : 'NO MATCH', 3.1) + txH(xe-5, ok ? 'SRC CARD ' + (Q.fact+1) : '0 RESULTS', 2.3);
+      s += clipTo(on(PZ(z), rectUV(W, 60, W+40, 116)), cs);
+    }
+  }
+
+  // ---- the agent terminal ----
+  s += box(ax0,ay0,0,ax1,ay1,ah, AGENT_M, tone, 1.2);
+  s += shape(on(PX(ax1+.2), rrUV(ay0+3,6,ay1-3,21,2)), '#1d2a26', 1.2);
+  s += tx(ax1+.3, (ay0+ay1)/2, 15.5, st.agent[0], 3.8, GLOW, 700) + tx(ax1+.3, (ay0+ay1)/2, 9.5, st.agent[1], 2.9, GLOW, 700);
+  s += box(ax0+2, ay0+1, ah, ax1-2, ay1-1, ah+1.5, METAL, toneI, .9);
+  s += hullInk([[ax0,ay0,0],[ax1,ay0,0],[ax1,ay1,0],[ax0,ay1,0],[ax0,ay0,ah],[ax1,ay0,ah],[ax1,ay1,ah],[ax0,ay1,ah]], 2.2);
+  // fact cards waiting on the agent's tray (the one being imported has left)
+  const waiting = FACTS.map((_,i) => i).filter(i => !st.facts[i] && !(st.imp && st.imp.i === i));
+  waiting.forEach((_,k) => { s += wzCard(stackTop(k), [0,CARD_U,0], flatV(0)); });
+
+  // ---- cards in the air ----
+  if (st.imp && st.imp.t < .82){
+    const t = st.imp.t, a = stackTop(waiting.length), hi = H + 14;
+    let c, ang = 0;
+    if (t < .22){ const e = ease(t/.22); c = [a[0], a[1], a[2] + (hi-a[2])*e]; }
+    else if (t < .55){ const e = ease((t-.22)/.33); c = [a[0]+(SLOT[0]-a[0])*e, a[1]+(SLOT[1]-a[1])*e, hi]; ang = e*Math.PI/2; }
+    else { const e = ease(Math.min(1,(t-.55)/.25)); c = [SLOT[0], SLOT[1], hi - (hi-(H-12))*e]; ang = Math.PI/2; }
+    const cs = wzCard(c, [0,CARD_U,0], flatV(ang));
+    s += ang > 1.5 ? clipTo(on(PX(SLOT[0]), rectUV(SLOT[1]-30, H, SLOT[1]+30, H+60)), cs) : cs;
+  }
+  if (st.fly){
+    const t = st.fly.t, e = ease(Math.min(1, t/.8)), a = [W+5, 88, 8.3], b = stackTop(waiting.length);
+    const c = [a[0]+(b[0]-a[0])*e, a[1]+(b[1]-a[1])*e, a[2]+(b[2]-a[2])*e + 34*Math.sin(Math.PI*e)];
+    s += wzCard(c, [0,CARD_U,0], [CARD_V,0,0], t < .8 ? 1 : Math.max(0, 1-(t-.8)/.2));
+  }
+
+  // ---- labels ----
+  s += tag([SLOT[0], 104, H], 70, -50, 'IMPORT', lit.intake);
+  s += tag(NODES.GRACE, 95, -55, 'WORLD GRAPH', lit.world);
+  s += tag([W+1.4, 108, 52], -88, 6, 'HYBRID SEARCH', lit.vector || lit.keyword);
+  s += tag([W+1.4, 68, 52], 58, 4, 'SPARQL', lit.sparql);
+  s += tag([W+12, 80, 8.3], -66, 26, 'PROVENANCE', !!st.out);
+  s += tag([ax1, (ay0+ay1)/2, 22], 44, -34, 'AGENT', !!st.fly);
+  return s;
+}
+
+/* ---------- behaviour ---------- */
+let ui;
+function run(key, secs, done){
+  st[key].t = 0;
+  ui.animate(dt => { if (!st[key]) return false; st[key].t = Math.min(1, st[key].t + dt/secs); if (st[key].t >= 1){ done(); return false; } return true; });
+}
+function importFact(i){
+  if (st.busy) return ui.flash('wait a moment, the machine is busy');
+  if (st.facts[i]) return ui.flash(FACTS[i].label + ' is already in the world');
+  st.busy = 'imp'; st.imp = { i, t:0 };
+  run('imp', 3.0, () => { st.facts[i] = true; st.imp = null; st.busy = null; });
+}
+function ask(q){
+  if (st.busy) return ui.flash('wait a moment, the machine is busy');
+  if (st.out) return ui.flash('hand the last answer to the agent first');
+  const ok = st.facts[QUESTIONS[q].fact];
+  st.busy = 'ask'; st.ask = { q, ok, t:0 };
+  run('ask', 2.6, () => { st.out = { q, ok }; st.ask = null; st.busy = null;
+    if (!ok) ui.flash('no match: import ' + FACTS[QUESTIONS[q].fact].label + ' first', 2600); });
+}
+function handOver(){
+  if (st.busy) return ui.flash('wait a moment, the machine is busy');
+  if (!st.out) return ui.flash('no answer yet: ask a question first');
+  const { q, ok } = st.out; st.out = null; st.busy = 'fly'; st.fly = { q, ok, t:0 };
+  run('fly', 1.4, () => { const Q = QUESTIONS[q]; st.agent = ok ? [Q.short, 'SRC CARD ' + (Q.fact+1)] : ['NO MATCH', '0 RESULTS'];
+    if (ok) st.answers++; st.fly = null; st.busy = null; });
+}
+
+ui = mountFigure({
+  fig:'01', title:'Wazoo world model', hint:'import facts, ask a question, hand the answer back',
+  idea:'Facts become a graph; questions are answered by vector, keyword and SPARQL search, and every answer names its source.',
+  size:[100,130,152], palette:'cobalt', state:st,
+  scene,
+  readout: () => screenLines().join(' '),
+  stats: st => [ { label:'Facts in world', value: factCount() }, { label:'Answers', value: st.answers, small:true } ],
+  buttonsLabel:'Agent',
+  buttons:[
+    { label:'Import a fact', choices: st => FACTS.map((F,i) => ({ label:F.label, current: st.facts[i], disabled: !!st.busy, why:'the machine is busy', onClick: () => importFact(i) })) },
+    { label:'Ask a question', choices: st => QUESTIONS.map((Q,q) => ({ label:Q.label, disabled: !!st.busy || !!st.out,
+        why: st.out ? 'hand the last answer to the agent first' : 'the machine is busy', onClick: () => ask(q) })) },
+    { label:'Hand answer to agent', onClick: handOver },
+  ],
+  params:(st,q) => {
+    const fs = q.get('facts'); if (fs) fs.split('').forEach((c,i) => { if (i < 3) st.facts[i] = c === '1'; });
+    if (q.has('out')){ const n = +q.get('out'); st.out = { q:n, ok: st.facts[QUESTIONS[n].fact] }; }
+  },
+});
+</script>
+</body>
+</html>
