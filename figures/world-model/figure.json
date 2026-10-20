@@ -1,0 +1,7 @@
+{
+  "project": "Wazoo",
+  "title": "World model",
+  "order": 1,
+  "blurb": "How Wazoo gives an agent memory: fact cards become nodes and edges in a world graph, get indexed for vector, keyword and SPARQL search, and every answer card names the fact it came from.",
+  "prompt": "Use the skill https://april-zhu.com/colorfigures to illustrate how https://wazoo.dev/ works."
+}
